@@ -24,6 +24,9 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor.parallel import loss_parallel
 
+from pippy.PipelineSchedule import ScheduleGPipe
+from pippy.PipelineStage import PipelineStage
+
 from torchtitan.checkpoint import CheckpointManager
 from torchtitan.config_manager import JobConfig
 from torchtitan.datasets import build_hf_data_loader, create_tokenizer
@@ -126,7 +129,9 @@ def main(job_config: JobConfig):
         world_size=world_size,
         enable_loss_parallel=job_config.training.enable_loss_parallel,
     )
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    # torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    torch.cuda.set_device(device)
     init_distributed(job_config)
 
     world_mesh = parallel_dims.build_mesh(device_type="cuda")
@@ -144,6 +149,14 @@ def main(job_config: JobConfig):
         dp_rank = dp_mesh.get_local_rank()
     else:
         dp_degree, dp_rank = 1, 0
+    
+    if parallel_dims.pp_enabled:
+        pp_mesh = world_mesh["pp"]
+        pp_degree = pp_mesh.size()
+        pp_rank = pp_mesh.get_local_rank()
+    else:
+        pp_degree, pp_rank = 1, 0
+
     data_loader = build_hf_data_loader(
         job_config.training.dataset,
         job_config.training.dataset_path,
@@ -203,9 +216,36 @@ def main(job_config: JobConfig):
     model = models_parallelize_fns[model_name](
         model, world_mesh, parallel_dims, job_config
     )
+
+    if parallel_dims.pp_enabled:
+        pipe_meta = model
+        model = pipe_meta.get_stage_module(pp_rank)
+
     # allocate sharded model on GPU and initialize weights via DTensor
     model.to_empty(device="cuda")
-    model.init_weights()
+
+    # TODO(whc) everything below needs to become a function that can be applied to each 'virtual stage' of PP, if
+    # there are virtual stages
+    if parallel_dims.pp_enabled:
+        stage = PipelineStage(
+            pipe=pipe_meta,
+            stage_index=pp_rank,
+            device=device,
+            group=pp_mesh.get_group(),
+        )
+        pp_schedule = ScheduleGPipe(
+            stage,
+            n_microbatches=parallel_dims.pp,
+            loss_fn=loss_fn,
+        )
+    else:
+        # if PP is enabled, we can't use init_weights. instead, we have to rely on offline creating an initial checkpoint
+        # and loading it to get initialization values.  This is becuase the init_weights functions are written assuming
+        # the whole model (all its weights, or FQNs) exist on one rank.  In PP, the init_weights on stage1 might crash
+        # becuase it can't find "embedding" layer, for example.
+
+        # allocate sharded model on GPU and initialize weights via DTensor
+        model.init_weights()
 
     gpu_mem_stats = gpu_memory_monitor.get_peak_stats()
     logger.info(
@@ -288,10 +328,29 @@ def main(job_config: JobConfig):
             optimizer.zero_grad()
 
             # forward / backward
-            with loss_parallel_ctx():
-                pred = model(input_ids)
-                loss = loss_fn(pred, labels)
-                loss.backward()
+            if parallel_dims.pp_enabled:
+                # pipeline parallel forward / backward inside step() call
+                is_last_stage = pp_mesh.get_local_rank() == pp_mesh.size() - 1
+                with loss_parallel_ctx():
+                    if pp_mesh.get_local_rank() == 0:
+                        pp_schedule.step(input_ids)
+                    elif is_last_stage:
+                        losses = []
+                        pp_schedule.step(target=labels, losses=losses)
+                    else:
+                        pp_schedule.step()
+
+                # accumulate losses across pipeline microbatches
+                loss = (
+                    torch.mean(torch.stack(losses))
+                    if is_last_stage
+                    else torch.Tensor([-1.0])
+                )
+            else:
+                with loss_parallel_ctx():
+                    pred = model(input_ids)
+                    loss = loss_fn(pred, labels)
+                    loss.backward()
 
             # clip gradients
             torch.nn.utils.clip_grad_norm_(
